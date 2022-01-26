@@ -35,6 +35,7 @@
 *.i*86
 *.x86_64
 *.hex
+dupscan
 
 # Debug files
 *.dSYM/
