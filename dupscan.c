@@ -49,7 +49,12 @@
 #include <string.h>
 
 #define HASH_SIZE	1049
-#define HASH_COMMAND	"sha256sum"
+
+#ifdef __FreeBSD__
+#  define HASH_COMMAND	"sha256"
+#else
+#  define HASH_COMMAND	"sha256sum"
+#endif
 
 /*
  * Structure for maintaining list of already-seen, original entries.
