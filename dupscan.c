@@ -58,6 +58,10 @@
 
 /*
  * Structure for maintaining list of already-seen, original entries.
+ * Keep the dev/ino pair so we can look for hard links (in the
+ * future). We keep the size as a quick test. Obviously, two files
+ * cannot be the same if they have different sizes. So, start with
+ * that parameter.
  */
 struct	entry	{
 	struct entry	*next;
@@ -82,7 +86,7 @@ struct entry	*freelist = NULL;
 /*
  * Prototypes.
  */
-void		build_dirs(char *);
+void		scan_dups(char *);
 void		process(char *, char *);
 void		regular_file(struct entry *);
 void		generate_hash(struct entry *);
@@ -103,10 +107,18 @@ main(int argc, char *argv[])
 	while ((i = getopt(argc, argv, "nv")) != EOF) {
 		switch (i) {
 		case 'n':
+			/*
+			 * "Claytons" mode. Don't do anything harmful
+			 * to the system - just report what might
+			 * have happened.
+			 */
 			no_effect = 1;
 			break;
 
 		case 'v':
+			/*
+			 * Be chatty.
+			 */
 			verbose = 1;
 			break;
 
@@ -119,7 +131,7 @@ main(int argc, char *argv[])
 		usage();
 	for (i = 0; i < HASH_SIZE; i++)
 		entry_list[i] = NULL;
-	build_dirs(argv[optind]);
+	scan_dups(argv[optind]);
 	exit(0);
 }
 
@@ -127,7 +139,7 @@ main(int argc, char *argv[])
  * Scan a directory recursively, and build a tree of unique entries.
  */
 void
-build_dirs(char *path)
+scan_dups(char *path)
 {
 	DIR *dirp;
 	struct dirent *dp;
@@ -147,7 +159,10 @@ build_dirs(char *path)
 }
 
 /*
- * Process a single file or directory.
+ * Process a single file or directory. We're looking for duplications.
+ * First check the file size against our "database" of file sizes
+ * and hashes. If the file size is identical, then check the file
+ * hash (generating it if needed.
  */
 void
 process(char *path, char *name)
@@ -156,6 +171,9 @@ process(char *path, char *name)
 	struct entry *ep;
 	struct stat stbuf;
 
+	/*
+	 * Allocate space for the fully-qualified path.
+	 */
 	if ((cp = (char *)malloc(strlen(path) + strlen(name) + 2)) == NULL) {
 		perror("process malloc");
 		exit(1);
@@ -169,6 +187,12 @@ process(char *path, char *name)
 	}
 	switch (stbuf.st_mode & S_IFMT) {
 	case S_IFREG:
+		/*
+		 * A regular file - ignore zero-length files. I
+		 * don't care about them. For everything else, store
+		 * what we've gleaned and call the regular file
+		 * function to see if there's a duplicate.
+		 */
 		if (stbuf.st_size > 0L) {
 			ep = entry_alloc(cp);
 			ep->size = stbuf.st_size;
@@ -180,15 +204,29 @@ process(char *path, char *name)
 		break;
 
 	case S_IFDIR:
-		build_dirs(cp);
+		/*
+		 * A directory - magic recursion!
+		 */
+		scan_dups(cp);
 		break;
 
 	case S_IFLNK:
+		/*
+		 * Not sure what to do about symlinks, but for the
+		 * most part, they're inert, so I'm ignoring them.
+		 */
 		if (verbose)
 			printf("Ignoring a symlink (%s).\n", cp);
 		break;
 
 	default:
+		/*
+		 * Must be a character-special or block-special
+		 * device. Not sure how that happened, in this day
+		 * and age. We must have crossed into /dev or
+		 * something. Either way, stop now before we do
+		 * real damage.
+		 */
 		fprintf(stderr, "Can't handle file type for %s.\n", cp);
 		exit(1);
 	}
@@ -196,6 +234,15 @@ process(char *path, char *name)
 
 /*
  * We have a regular file - is it a duplicate?
+ *
+ * Where a duplicate file is found, perform some sort of action.
+ * This would normally be to create a symlink back to the original.
+ * A nicer optimization might be to just record the duplicate, and
+ * then mark the actual directory as a duplicate if all the files
+ * in the directory are duplicates. Then, just remove all the files
+ * in a duplicate directory (recursively). Finally, symlink the
+ * directory or the individual files back to their originals. One
+ * "gotcha" with that approach is cross-links in two dirs.
  */
 void
 regular_file(struct entry *ep)
@@ -213,7 +260,7 @@ regular_file(struct entry *ep)
 
 /*
  * Find an existing entry, based on the current (passed-in) entry. Returns
- * TRUE IFF the entry already exists.
+ * the original entry if one already exists.
  */
 struct entry *
 find_entry(struct entry *orig_ep)
@@ -225,7 +272,6 @@ find_entry(struct entry *orig_ep)
 	if (verbose)
 		printf("Search for file: %s (size:%ld,hash%d).\n", orig_ep->path, orig_ep->size, hash);
 	if (entry_list[hash] == NULL || entry_list[hash]->size > orig_ep->size) {
-		generate_hash(orig_ep);
 		orig_ep->next = entry_list[hash];
 		entry_list[hash] = orig_ep;
 		return(NULL);
@@ -237,8 +283,20 @@ find_entry(struct entry *orig_ep)
 			 */
 			if (verbose)
 				printf("Matches (size) for %s.\n", ep->path);
+			/*
+			 * We do a "lazy-load" of the hash entry.
+			 * In other words, only hash the file(s)
+			 * if there is a size match. In a perfect
+			 * world, all the files would have different
+			 * sizes, and we'd have no need to compute
+			 * a hash. So, in the optimistic hope that
+			 * this is the case, we delay the hash
+			 * computation until we need it.
+			 */
 			if (orig_ep->hash == NULL)
 				generate_hash(orig_ep);
+			if (ep->hash == NULL)
+				generate_hash(ep);
 			if (strcmp(ep->hash, orig_ep->hash) == 0) {
 				if (verbose)
 					printf("Matches (hash).\n");
@@ -250,8 +308,6 @@ find_entry(struct entry *orig_ep)
 	/*
 	 * No match for the file. Need to add it in the current position.
 	 */
-	if (orig_ep->hash == NULL)
-		generate_hash(orig_ep);
 	orig_ep->next = last_ep->next;
 	last_ep->next = orig_ep;
 	return(NULL);
@@ -291,7 +347,7 @@ generate_hash(struct entry *ep)
 }
 
 /*
- * Allocate a new entry
+ * Allocate a new entry and set some basics, like the full path.
  */
 struct entry *
 entry_alloc(char *name)
@@ -329,7 +385,7 @@ entry_free(struct entry *ep)
 }
 
 /*
- *
+ * Print a usage message and exit.
  */
 void
 usage()
